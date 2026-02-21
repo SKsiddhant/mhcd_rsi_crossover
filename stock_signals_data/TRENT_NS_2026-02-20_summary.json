@@ -1,12 +1,12 @@
 {
     "ticker": "TRENT.NS",
     "data_as_of": "2026-02-20",
-    "rsi_buy_thresh": 60,
+    "rsi_buy_thresh": 65,
     "sell_condition": "MACD bearish crossover only (RSI ignored)",
-    "total_trades": 19,
-    "profitable": 9,
-    "loss_trades": 10,
-    "net_pnl": 1094.92,
+    "total_trades": 13,
+    "profitable": 7,
+    "loss_trades": 6,
+    "net_pnl": 826.47,
     "open_position": null,
-    "generated_at": "2026-02-21 13:17:51"
+    "generated_at": "2026-02-21 19:04:00"
 }

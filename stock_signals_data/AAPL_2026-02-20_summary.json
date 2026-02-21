@@ -1,0 +1,12 @@
+{
+    "ticker": "AAPL",
+    "data_as_of": "2026-02-20",
+    "rsi_buy_thresh": 60,
+    "sell_condition": "MACD bearish crossover only (RSI ignored)",
+    "total_trades": 21,
+    "profitable": 9,
+    "loss_trades": 12,
+    "net_pnl": 31.74,
+    "open_position": null,
+    "generated_at": "2026-02-21 14:03:54"
+}
