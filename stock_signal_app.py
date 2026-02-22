@@ -3,7 +3,8 @@
 ║        MACD + RSI  Stock Signal Analyzer  —  Streamlit       ║
 ║                                                              ║
 ║  BUY  → MACD bullish crossover  AND  RSI ≥ user threshold   ║
-║  SELL → MACD bearish crossover  (RSI does NOT matter)        ║
+║  SELL → MACD bearish crossover                               ║
+║      OR price drops ≥ user stop-loss % below entry          ║
 ║                                                              ║
 ║  Run:  streamlit run stock_signal_app.py                     ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -168,12 +169,16 @@ def detect_signals(df: pd.DataFrame, rsi_buy: float) -> pd.DataFrame:
     return df
 
 # ── Trade Simulation ─────────────────────────────────────────
-def simulate_trades(df: pd.DataFrame):
+def simulate_trades(df: pd.DataFrame, stop_loss_pct: float = 0.0):
+    """
+    BUY  : MACD bullish crossover AND RSI >= threshold
+    SELL : MACD bearish crossover  OR  price drops >= stop_loss_pct% below entry
+           (whichever triggers first — OR condition)
+    """
     trades   = []
     position = None
 
     for idx, row in df.iterrows():
-        # str() cast ensures comparison works regardless of stored dtype
         sig   = str(row["signal"]).strip()
         price = float(row["Close"])
 
@@ -185,29 +190,49 @@ def simulate_trades(df: pd.DataFrame):
                 "entry_macd"  : round(float(row["MACD"]), 4),
             }
 
-        elif sig == "SELL" and position is not None:
-            # ← Triggered by MACD bearish crossover alone — no RSI check
-            pnl     = price - position["entry_price"]
-            pnl_pct = (pnl / position["entry_price"]) * 100
+        elif position is not None:
+            # Condition 1: MACD bearish crossover
+            macd_sell = (sig == "SELL")
 
-            trades.append({
-                "Trade #"    : len(trades) + 1,
-                "Entry Date" : str(position["entry_date"]),
-                "Entry Price": round(position["entry_price"], 2),
-                "RSI at Buy" : position["entry_rsi"],
-                "Exit Date"  : str(idx.date()),
-                "Exit Price" : round(price, 2),
-                "RSI at Sell": round(float(row["RSI"]), 2),
-                "P&L"        : round(pnl, 2),
-                "P&L %"      : round(pnl_pct, 2),
-                "Result"     : "PROFIT" if pnl >= 0 else "LOSS",
-            })
-            position = None
+            # Condition 2: Stop-loss — price dropped >= stop_loss_pct% below entry
+            stop_loss_triggered = (
+                stop_loss_pct > 0
+                and price <= position["entry_price"] * (1 - stop_loss_pct / 100)
+            )
+
+            if macd_sell or stop_loss_triggered:
+                pnl     = price - position["entry_price"]
+                pnl_pct = (pnl / position["entry_price"]) * 100
+
+                if macd_sell and stop_loss_triggered:
+                    sell_reason = "MACD + Stop-Loss"
+                elif stop_loss_triggered:
+                    sell_reason = f"Stop-Loss ({stop_loss_pct}%)"
+                else:
+                    sell_reason = "MACD Crossover"
+
+                days_held = (idx.date() - position["entry_date"]).days
+
+                trades.append({
+                    "Trade #"    : len(trades) + 1,
+                    "Entry Date" : str(position["entry_date"]),
+                    "Entry Price": round(position["entry_price"], 2),
+                    "RSI at Buy" : position["entry_rsi"],
+                    "Exit Date"  : str(idx.date()),
+                    "Exit Price" : round(price, 2),
+                    "RSI at Sell": round(float(row["RSI"]), 2),
+                    "Days Held"  : days_held,
+                    "Sell Reason": sell_reason,
+                    "P&L"        : round(pnl, 2),
+                    "P&L %"      : round(pnl_pct, 2),
+                    "Result"     : "PROFIT" if pnl >= 0 else "LOSS",
+                })
+                position = None
 
     return pd.DataFrame(trades), position
 
 # ── Save Results ─────────────────────────────────────────────
-def save_results(ticker, rsi_buy, trades_df, open_pos, df):
+def save_results(ticker, rsi_buy, stop_loss_pct, trades_df, open_pos, df):
     yesterday = str(df.index[-1].date())
     safe      = ticker.replace(".", "_").replace("^", "")
     base      = os.path.join(DATA_DIR, f"{safe}_{yesterday}")
@@ -215,11 +240,12 @@ def save_results(ticker, rsi_buy, trades_df, open_pos, df):
     total   = len(trades_df)
     winners = int((trades_df["P&L"] > 0).sum()) if total else 0
 
+    sl_desc = f"stop-loss at -{stop_loss_pct}% below entry" if stop_loss_pct > 0 else "disabled"
     summary = {
         "ticker"         : ticker,
         "data_as_of"     : yesterday,
         "rsi_buy_thresh" : rsi_buy,
-        "sell_condition" : "MACD bearish crossover only (RSI ignored)",
+        "sell_condition" : f"MACD bearish crossover OR {sl_desc}",
         "total_trades"   : total,
         "profitable"     : winners,
         "loss_trades"    : total - winners,
@@ -367,6 +393,13 @@ with st.sidebar:
         help="BUY signal fires only when RSI is at or above this value at the crossover",
     )
 
+    stop_loss_pct = st.slider(
+        "🛑 Stop-Loss % Below Entry Price",
+        min_value=0, max_value=30, value=5, step=1,
+        help="SELL triggers if price drops this % below your buy price. Set 0 to disable.",
+        format="%d%%",
+    )
+
     lookback = st.selectbox(
         "📅 Historical Data Range",
         options=[1, 2, 3, 5, 10],
@@ -375,15 +408,16 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    sl_label = f"Price drops ≥ {stop_loss_pct}% below entry" if stop_loss_pct > 0 else "Stop-loss: disabled (set to 0%)"
     st.markdown(f"""
     <div class="logic-box">
     <b>🟢 BUY Signal</b><br>
     MACD line crosses <b>above</b> Signal line<br>
     <i>+ RSI must be ≥ {rsi_buy}</i>
     <br><br>
-    <b>🔴 SELL Signal</b><br>
-    MACD line crosses <b>below</b> Signal line<br>
-    <i>RSI value is completely ignored</i>
+    <b>🔴 SELL Signal</b> &nbsp;<span style="color:#ff9800">(OR condition)</span><br>
+    ① MACD line crosses <b>below</b> Signal line<br>
+    ② {sl_label}
     </div>
     """, unsafe_allow_html=True)
 
@@ -410,10 +444,10 @@ if not run:
         """)
     with col2:
         st.error("""
-        **🔴 SELL Condition**
-        - MACD line crosses **below** the Signal line (bearish crossover)
-        - RSI value is **completely ignored**
-        - The crossover alone is enough to exit the trade
+        **🔴 SELL Condition  (OR)**
+        - ① MACD line crosses **below** the Signal line (bearish crossover)
+        - ② Price drops ≥ your **stop-loss %** below entry price
+        - **Either** condition alone is enough to exit the trade
         """)
     st.stop()
 
@@ -440,8 +474,8 @@ if raw_df is None or raw_df.empty:
 # ── Process ───────────────────────────────────────────────────
 df                  = add_indicators(raw_df.copy())
 df                  = detect_signals(df, rsi_buy)
-trades_df, open_pos = simulate_trades(df)
-save_results(ticker_input, rsi_buy, trades_df, open_pos, df)
+trades_df, open_pos = simulate_trades(df, stop_loss_pct)
+save_results(ticker_input, rsi_buy, stop_loss_pct, trades_df, open_pos, df)
 
 # ── Derived stats ─────────────────────────────────────────────
 yesterday = df.index[-1].date()
@@ -460,26 +494,29 @@ worst     = round(trades_df["P&L"].min(), 2) if total else 0
 st.markdown(f"### {ticker_input} &nbsp;·&nbsp; Data as of `{yesterday}` &nbsp;·&nbsp; LTP: `{ltp}`")
 
 # ── Metric Cards Row ──────────────────────────────────────────
-c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-metric_card(c1, "Last Close",      f"{ltp}",         "")
-metric_card(c2, "Total Trades",    total,             "purple")
-metric_card(c3, "Profitable",      winners,           "green")
-metric_card(c4, "Loss Trades",     losers,            "red")
-metric_card(c5, "Win Rate",        f"{win_rate}%",    "green" if win_rate >= 50 else "red")
-metric_card(c6, "Net P&L / share", f"{net_pnl}",      "green" if net_pnl >= 0 else "red")
-metric_card(c7, "RSI Buy ≥",       f"{int(rsi_buy)}", "yellow")
+c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+metric_card(c1, "Last Close",      f"{ltp}",                    "")
+metric_card(c2, "Total Trades",    total,                        "purple")
+metric_card(c3, "Profitable",      winners,                      "green")
+metric_card(c4, "Loss Trades",     losers,                       "red")
+metric_card(c5, "Win Rate",        f"{win_rate}%",               "green" if win_rate >= 50 else "red")
+metric_card(c6, "Net P&L / share", f"{net_pnl}",                 "green" if net_pnl >= 0 else "red")
+metric_card(c7, "RSI Buy ≥",       f"{int(rsi_buy)}",            "yellow")
+metric_card(c8, "Stop-Loss",       f"{stop_loss_pct}%" if stop_loss_pct > 0 else "OFF", "red" if stop_loss_pct > 0 else "")
 
 # ── Open Position Banner ──────────────────────────────────────
 if open_pos:
-    unr     = round(ltp - open_pos["entry_price"], 2)
-    unr_pct = round((unr / open_pos["entry_price"]) * 100, 2)
-    color   = "#00e676" if unr >= 0 else "#ff5252"
+    unr      = round(ltp - open_pos["entry_price"], 2)
+    unr_pct  = round((unr / open_pos["entry_price"]) * 100, 2)
+    color    = "#00e676" if unr >= 0 else "#ff5252"
+    days_open = (yesterday - open_pos["entry_date"]).days
     st.markdown(f"""
     <div class="open-position-box">
         ⚠️ <strong style="color:#ffd600">OPEN POSITION — Trade not yet closed</strong><br>
         &nbsp;&nbsp;Bought @ <strong>{open_pos['entry_price']}</strong>
         on <strong>{open_pos['entry_date']}</strong>
         &nbsp;|&nbsp; RSI at entry: <strong>{open_pos['entry_rsi']}</strong>
+        &nbsp;|&nbsp; Days Running: <strong style="color:#ffd600">{days_open}d</strong>
         &nbsp;|&nbsp; Current LTP: <strong>{ltp}</strong>
         &nbsp;|&nbsp; Unrealised P&L:
         <strong style="color:{color}">{unr} ({unr_pct}%)</strong>
@@ -516,6 +553,7 @@ else:
             "Exit Price"  : "{:.2f}",
             "RSI at Buy"  : "{:.1f}",
             "RSI at Sell" : "{:.1f}",
+            "Days Held"   : "{:d}d",
             "P&L"         : "{:.2f}",
             "P&L %"       : "{:.2f}",
         })
@@ -591,21 +629,22 @@ with d2:
 
 with d3:
     summary_json = {
-        "ticker"         : ticker_input,
-        "data_as_of"     : str(yesterday),
-        "rsi_buy_thresh" : rsi_buy,
-        "sell_condition" : "MACD bearish crossover only (RSI ignored)",
-        "total_trades"   : total,
-        "profitable"     : winners,
-        "loss_trades"    : losers,
-        "win_rate_pct"   : win_rate,
-        "net_pnl"        : net_pnl,
-        "avg_win"        : avg_win,
-        "avg_loss"       : avg_loss,
-        "best_trade"     : best,
-        "worst_trade"    : worst,
-        "open_position"  : str(open_pos) if open_pos else None,
-        "generated_at"   : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ticker"          : ticker_input,
+        "data_as_of"      : str(yesterday),
+        "rsi_buy_thresh"  : rsi_buy,
+        "stop_loss_pct"   : stop_loss_pct,
+        "sell_condition"  : f"MACD bearish crossover OR stop-loss -{stop_loss_pct}% (whichever first)",
+        "total_trades"    : total,
+        "profitable"      : winners,
+        "loss_trades"     : losers,
+        "win_rate_pct"    : win_rate,
+        "net_pnl"         : net_pnl,
+        "avg_win"         : avg_win,
+        "avg_loss"        : avg_loss,
+        "best_trade"      : best,
+        "worst_trade"     : worst,
+        "open_position"   : str(open_pos) if open_pos else None,
+        "generated_at"    : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     st.download_button(
         "⬇️ Summary JSON",
@@ -619,5 +658,6 @@ st.markdown("---")
 st.caption(
     f"📁 Auto-saved to `stock_signals_data/`  ·  "
     f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ·  "
-    f"Ticker: {ticker_input}  ·  RSI Buy ≥ {rsi_buy}  ·  Sell: MACD bearish crossover only"
+    f"Ticker: {ticker_input}  ·  RSI Buy ≥ {rsi_buy}  ·  "
+    f"Sell: MACD bearish crossover OR stop-loss -{stop_loss_pct}%"
 )
