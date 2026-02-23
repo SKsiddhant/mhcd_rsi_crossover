@@ -231,7 +231,34 @@ def simulate_trades(df: pd.DataFrame, stop_loss_pct: float = 0.0):
 
     return pd.DataFrame(trades), position
 
-# ── Save Results ─────────────────────────────────────────────
+# ── RSI Sweep ─────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def rsi_sweep(df_with_indicators: pd.DataFrame, stop_loss_pct: float) -> pd.DataFrame:
+    """Run RSI threshold from 1 to 100 and collect stats for each."""
+    rows = []
+    for rsi_val in range(1, 101):
+        swept    = detect_signals(df_with_indicators.copy(), float(rsi_val))
+        t_df, _  = simulate_trades(swept, stop_loss_pct)
+
+        n        = len(t_df)
+        wins     = int((t_df["P&L"] > 0).sum()) if n else 0
+        losses   = n - wins
+        net      = round(t_df["P&L"].sum(), 2)      if n else 0.0
+        wr       = round(wins / n * 100, 1)          if n else 0.0
+        avg_w    = round(t_df.loc[t_df["P&L"] > 0, "P&L"].mean(), 2) if wins   else 0.0
+        avg_l    = round(t_df.loc[t_df["P&L"] < 0, "P&L"].mean(), 2) if losses else 0.0
+
+        rows.append({
+            "RSI Threshold" : rsi_val,
+            "Trades"        : n,
+            "Wins"          : wins,
+            "Losses"        : losses,
+            "Win Rate %"    : wr,
+            "Net P&L"       : net,
+            "Avg Win"       : avg_w,
+            "Avg Loss"      : avg_l,
+        })
+    return pd.DataFrame(rows)
 def save_results(ticker, rsi_buy, stop_loss_pct, trades_df, open_pos, df):
     yesterday = str(df.index[-1].date())
     safe      = ticker.replace(".", "_").replace("^", "")
@@ -600,6 +627,100 @@ else:
             margin=dict(l=10, r=10, t=20, b=10),
         )
         st.plotly_chart(eq_fig, use_container_width=True)
+
+st.markdown("---")
+
+# ── RSI Sweep Table ───────────────────────────────────────────
+st.markdown("### 🔬 RSI Threshold Sweep  (1 → 100)")
+st.caption("Net P&L and key stats for every possible RSI buy threshold, using the same stop-loss setting.")
+
+with st.spinner("Running RSI sweep across all 100 thresholds …"):
+    sweep_df = rsi_sweep(df, stop_loss_pct)
+
+sw_col1, sw_col2 = st.columns([2, 1])
+
+with sw_col1:
+    sort_by = st.selectbox(
+        "📊 Sort table by",
+        options=["RSI Threshold", "Net P&L", "Win Rate %", "Trades", "Avg Win", "Avg Loss"],
+        index=1,
+    )
+
+with sw_col2:
+    sort_order = st.radio(
+        "Order",
+        options=["⬆️ Ascending", "⬇️ Descending"],
+        index=1,
+        horizontal=True,
+    )
+
+ascending = (sort_order == "⬆️ Ascending")
+sweep_sorted = sweep_df.sort_values(sort_by, ascending=ascending).reset_index(drop=True)
+
+# highlight best RSI row (highest net P&L)
+best_rsi_row = sweep_df.loc[sweep_df["Net P&L"].idxmax(), "RSI Threshold"]
+
+def color_net_pnl(val):
+    try:
+        v = float(val)
+        if v > 0:   return "color: #00e676; font-weight: 700;"
+        elif v < 0: return "color: #ff5252; font-weight: 700;"
+    except:
+        pass
+    return ""
+
+def color_winrate(val):
+    try:
+        v = float(val)
+        if v >= 60:  return "color: #00e676;"
+        elif v >= 45: return "color: #ffd600;"
+        else:         return "color: #ff5252;"
+    except:
+        pass
+    return ""
+
+def highlight_best(row):
+    if row["RSI Threshold"] == best_rsi_row:
+        return ["background-color: #1a2e1a; border-left: 3px solid #00e676;"] * len(row)
+    return [""] * len(row)
+
+sweep_styled = (
+    sweep_sorted.style
+    .apply(highlight_best, axis=1)
+    .applymap(color_net_pnl,  subset=["Net P&L", "Avg Win", "Avg Loss"])
+    .applymap(color_winrate,  subset=["Win Rate %"])
+    .format({
+        "RSI Threshold" : "{:d}",
+        "Trades"        : "{:d}",
+        "Wins"          : "{:d}",
+        "Losses"        : "{:d}",
+        "Win Rate %"    : "{:.1f}%",
+        "Net P&L"       : "{:.2f}",
+        "Avg Win"       : "{:.2f}",
+        "Avg Loss"      : "{:.2f}",
+    })
+    .set_properties(**{"text-align": "center"})
+)
+
+st.dataframe(sweep_styled, use_container_width=True, hide_index=True, height=420)
+
+# Summary callout
+best_net  = round(sweep_df["Net P&L"].max(), 2)
+best_rsi  = int(sweep_df.loc[sweep_df["Net P&L"].idxmax(), "RSI Threshold"])
+worst_net = round(sweep_df["Net P&L"].min(), 2)
+worst_rsi = int(sweep_df.loc[sweep_df["Net P&L"].idxmin(), "RSI Threshold"])
+
+sc1, sc2 = st.columns(2)
+sc1.success(f"🏆 **Best RSI threshold: {best_rsi}** → Net P&L: **{best_net}**")
+sc2.error(  f"💀 **Worst RSI threshold: {worst_rsi}** → Net P&L: **{worst_net}**")
+
+# Download sweep table
+st.download_button(
+    "⬇️ Download RSI Sweep CSV",
+    data=sweep_sorted.to_csv(index=False),
+    file_name=f"{ticker_input}_rsi_sweep_{yesterday}.csv",
+    mime="text/csv",
+)
 
 st.markdown("---")
 
