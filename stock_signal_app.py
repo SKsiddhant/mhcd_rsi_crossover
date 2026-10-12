@@ -20,6 +20,11 @@ import ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from signal_engine import (
+    WARMUP_DAYS, add_indicators, detect_signals, safe_filename_part,
+    simulate_trades, sweep_rsi, trim_to_years, validate_ticker,
+)
+
 # ── Page Config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="MACD + RSI Signal Analyzer",
@@ -86,18 +91,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ────────────────────────────────────────────────
-DATA_DIR = "stock_signals_data"
-os.makedirs(DATA_DIR, exist_ok=True)
+DATA_DIR = os.environ.get("SIGNALS_DATA_DIR", "stock_signals_data")
 
 # ── Data Fetching ────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=900)
 def fetch_data(ticker: str, years: int) -> pd.DataFrame:
-    try:
-        period_map = {1: "1y", 2: "2y", 3: "5y", 5: "5y", 10: "10y"}
-        period = period_map.get(years, "5y")
+    """Daily bars for the last `years` years plus indicator warm-up history.
 
-        t  = yf.Ticker(ticker)
-        df = t.history(period=period, auto_adjust=True)
+    Cached for 15 minutes so a transient Yahoo failure is not remembered forever.
+    """
+    try:
+        start = datetime.today() - timedelta(days=int(years * 365.25) + WARMUP_DAYS)
+        df = yf.Ticker(ticker).history(start=start.strftime("%Y-%m-%d"), auto_adjust=True)
 
         if df is None or df.empty:
             return pd.DataFrame()
@@ -106,162 +111,31 @@ def fetch_data(ticker: str, years: int) -> pd.DataFrame:
             df.columns = df.columns.get_level_values(0)
 
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        df   = df[keep].copy()
+        df = df[keep].copy()
         df.index = pd.to_datetime(df.index)
 
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
 
-        # Only keep up to yesterday's close
+        # Only keep up to yesterday's close (today's bar is still forming)
         yesterday = (datetime.today() - timedelta(days=1)).date()
-        df = df[df.index.date <= yesterday]
-
-        return df
+        return df[df.index.date <= yesterday]
 
     except Exception as e:
         st.error(f"❌ Error fetching data: {e}")
         return pd.DataFrame()
 
-# ── Indicator Calculation ────────────────────────────────────
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # Always squeeze + .values to ensure plain 1-D numpy arrays — fixes yfinance multi-index issues
-    close = df["Close"].squeeze()
-
-    macd_obj = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
-    df["MACD"]        = macd_obj.macd().squeeze().values
-    df["MACD_signal"] = macd_obj.macd_signal().squeeze().values
-    df["MACD_hist"]   = macd_obj.macd_diff().squeeze().values
-    df["RSI"]         = ta.momentum.RSIIndicator(close, window=14).rsi().squeeze().values
-
-    return df.dropna()
-
-# ── Signal Detection ─────────────────────────────────────────
-def detect_signals(df: pd.DataFrame, rsi_buy: float) -> pd.DataFrame:
-    """
-    BUY  : MACD bullish crossover  AND  RSI >= rsi_buy
-    SELL : MACD bearish crossover  (RSI is completely ignored)
-    """
-    import numpy as np
-
-    df = df.copy()
-
-    # Cast explicitly to float Series — prevents silent DataFrame wrapping bugs
-    macd   = df["MACD"].astype(float)
-    sig_ln = df["MACD_signal"].astype(float)
-    rsi    = df["RSI"].astype(float)
-
-    prev_macd = macd.shift(1)
-    prev_sig  = sig_ln.shift(1)
-
-    # Bullish: was below signal yesterday, at/above today
-    bull_cross = (prev_macd < prev_sig) & (macd >= sig_ln)
-    # Bearish: was above signal yesterday, at/below today
-    bear_cross = (prev_macd > prev_sig) & (macd <= sig_ln)
-
-    buy_signal  = bull_cross & (rsi >= rsi_buy)
-    sell_signal = bear_cross   # RSI completely ignored for SELL
-
-    # numpy.where avoids pandas object-dtype .loc assignment bugs entirely
-    df["signal"]     = np.where(buy_signal, "BUY", np.where(sell_signal, "SELL", ""))
-    df["bull_cross"] = bull_cross
-    df["bear_cross"] = bear_cross
-
-    return df
-
-# ── Trade Simulation ─────────────────────────────────────────
-def simulate_trades(df: pd.DataFrame, stop_loss_pct: float = 0.0):
-    """
-    BUY  : MACD bullish crossover AND RSI >= threshold
-    SELL : MACD bearish crossover  OR  price drops >= stop_loss_pct% below entry
-           (whichever triggers first — OR condition)
-    """
-    trades   = []
-    position = None
-
-    for idx, row in df.iterrows():
-        sig   = str(row["signal"]).strip()
-        price = float(row["Close"])
-
-        if sig == "BUY" and position is None:
-            position = {
-                "entry_date"  : idx.date(),
-                "entry_price" : price,
-                "entry_rsi"   : round(float(row["RSI"]), 2),
-                "entry_macd"  : round(float(row["MACD"]), 4),
-            }
-
-        elif position is not None:
-            # Condition 1: MACD bearish crossover
-            macd_sell = (sig == "SELL")
-
-            # Condition 2: Stop-loss — price dropped >= stop_loss_pct% below entry
-            stop_loss_triggered = (
-                stop_loss_pct > 0
-                and price <= position["entry_price"] * (1 - stop_loss_pct / 100)
-            )
-
-            if macd_sell or stop_loss_triggered:
-                pnl     = price - position["entry_price"]
-                pnl_pct = (pnl / position["entry_price"]) * 100
-
-                if macd_sell and stop_loss_triggered:
-                    sell_reason = "MACD + Stop-Loss"
-                elif stop_loss_triggered:
-                    sell_reason = f"Stop-Loss ({stop_loss_pct}%)"
-                else:
-                    sell_reason = "MACD Crossover"
-
-                days_held = (idx.date() - position["entry_date"]).days
-
-                trades.append({
-                    "Trade #"    : len(trades) + 1,
-                    "Entry Date" : str(position["entry_date"]),
-                    "Entry Price": round(position["entry_price"], 2),
-                    "RSI at Buy" : position["entry_rsi"],
-                    "Exit Date"  : str(idx.date()),
-                    "Exit Price" : round(price, 2),
-                    "RSI at Sell": round(float(row["RSI"]), 2),
-                    "Days Held"  : days_held,
-                    "Sell Reason": sell_reason,
-                    "P&L"        : round(pnl, 2),
-                    "P&L %"      : round(pnl_pct, 2),
-                    "Result"     : "PROFIT" if pnl >= 0 else "LOSS",
-                })
-                position = None
-
-    return pd.DataFrame(trades), position
-
 # ── RSI Sweep ─────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def rsi_sweep(df_with_indicators: pd.DataFrame, stop_loss_pct: float) -> pd.DataFrame:
     """Run RSI threshold from 1 to 100 and collect stats for each."""
-    rows = []
-    for rsi_val in range(1, 101):
-        swept    = detect_signals(df_with_indicators.copy(), float(rsi_val))
-        t_df, _  = simulate_trades(swept, stop_loss_pct)
+    return sweep_rsi(df_with_indicators, stop_loss_pct)
 
-        n        = len(t_df)
-        wins     = int((t_df["P&L"] > 0).sum()) if n else 0
-        losses   = n - wins
-        net      = round(t_df["P&L"].sum(), 2)      if n else 0.0
-        wr       = round(wins / n * 100, 1)          if n else 0.0
-        avg_w    = round(t_df.loc[t_df["P&L"] > 0, "P&L"].mean(), 2) if wins   else 0.0
-        avg_l    = round(t_df.loc[t_df["P&L"] < 0, "P&L"].mean(), 2) if losses else 0.0
 
-        rows.append({
-            "RSI Threshold" : rsi_val,
-            "Trades"        : n,
-            "Wins"          : wins,
-            "Losses"        : losses,
-            "Win Rate %"    : wr,
-            "Net P&L"       : net,
-            "Avg Win"       : avg_w,
-            "Avg Loss"      : avg_l,
-        })
-    return pd.DataFrame(rows)
 def save_results(ticker, rsi_buy, stop_loss_pct, trades_df, open_pos, df):
+    os.makedirs(DATA_DIR, exist_ok=True)
     yesterday = str(df.index[-1].date())
-    safe      = ticker.replace(".", "_").replace("^", "")
+    safe      = safe_filename_part(ticker)
     base      = os.path.join(DATA_DIR, f"{safe}_{yesterday}")
 
     total   = len(trades_df)
@@ -272,6 +146,7 @@ def save_results(ticker, rsi_buy, stop_loss_pct, trades_df, open_pos, df):
         "ticker"         : ticker,
         "data_as_of"     : yesterday,
         "rsi_buy_thresh" : rsi_buy,
+        "stop_loss_pct"  : stop_loss_pct,
         "sell_condition" : f"MACD bearish crossover OR {sl_desc}",
         "total_trades"   : total,
         "profitable"     : winners,
@@ -450,7 +325,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("💾 Results auto-saved to `stock_signals_data/`")
-    run = st.button("🚀  Run Analysis", use_container_width=True)
+    run = st.button("🚀  Run Analysis", width="stretch")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -459,7 +334,12 @@ with st.sidebar:
 st.markdown("# 📈 MACD + RSI Stock Signal Analyzer")
 st.caption("Yahoo Finance data  ·  MACD (12,26,9)  ·  RSI (14)  ·  Data up to yesterday's close")
 
-if not run:
+# Streamlit reruns the whole script on every widget change (e.g. the sweep "Sort by" box).
+# Remember that analysis was requested, otherwise the results vanish on the first interaction.
+if run:
+    st.session_state["analysis_requested"] = True
+
+if not st.session_state.get("analysis_requested"):
     st.info("👈  Enter a **stock ticker** in the sidebar, set your **RSI threshold**, then click **Run Analysis**.")
     col1, col2 = st.columns(2)
     with col1:
@@ -482,6 +362,12 @@ if not ticker_input:
     st.error("⚠️ Please enter a stock ticker symbol in the sidebar.")
     st.stop()
 
+try:
+    ticker_input = validate_ticker(ticker_input)
+except ValueError as exc:
+    st.error(f"⚠️ {exc}")
+    st.stop()
+
 # ── Fetch ─────────────────────────────────────────────────────
 with st.spinner(f"Fetching data for **{ticker_input}** …"):
     raw_df = fetch_data(ticker_input, lookback)
@@ -499,7 +385,11 @@ if raw_df is None or raw_df.empty:
     st.stop()
 
 # ── Process ───────────────────────────────────────────────────
-df                  = add_indicators(raw_df.copy())
+df                  = add_indicators(raw_df)
+df                  = trim_to_years(df, lookback)
+if df.empty:
+    st.error(f"❌ Not enough price history for **{ticker_input}** to calculate MACD/RSI.")
+    st.stop()
 df                  = detect_signals(df, rsi_buy)
 trades_df, open_pos = simulate_trades(df, stop_loss_pct)
 save_results(ticker_input, rsi_buy, stop_loss_pct, trades_df, open_pos, df)
@@ -552,7 +442,7 @@ if open_pos:
 st.markdown("---")
 
 # ── Chart ─────────────────────────────────────────────────────
-st.plotly_chart(build_chart(df, ticker_input, rsi_buy), use_container_width=True)
+st.plotly_chart(build_chart(df, ticker_input, rsi_buy), width="stretch")
 
 st.markdown("---")
 
@@ -568,13 +458,13 @@ else:
     def color_pnl(val):
         try:
             return "color: #00e676; font-weight:700;" if float(val) >= 0 else "color: #ff5252; font-weight:700;"
-        except:
+        except (TypeError, ValueError):
             return ""
 
     styled = (
         trades_df.style
-        .applymap(color_result, subset=["Result"])
-        .applymap(color_pnl,    subset=["P&L", "P&L %"])
+        .map(color_result, subset=["Result"])
+        .map(color_pnl,    subset=["P&L", "P&L %"])
         .format({
             "Entry Price" : "{:.2f}",
             "Exit Price"  : "{:.2f}",
@@ -586,7 +476,7 @@ else:
         })
         .set_properties(**{"text-align": "center"})
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
 
     # ── Performance Stats ──────────────────────────────────────
     st.markdown("### 📊 Performance Statistics")
@@ -626,7 +516,7 @@ else:
             yaxis=dict(title="Cumulative P&L (per share)", gridcolor="#1e2130"),
             margin=dict(l=10, r=10, t=20, b=10),
         )
-        st.plotly_chart(eq_fig, use_container_width=True)
+        st.plotly_chart(eq_fig, width="stretch")
 
 st.markdown("---")
 
@@ -665,7 +555,7 @@ def color_net_pnl(val):
         v = float(val)
         if v > 0:   return "color: #00e676; font-weight: 700;"
         elif v < 0: return "color: #ff5252; font-weight: 700;"
-    except:
+    except (TypeError, ValueError):
         pass
     return ""
 
@@ -675,7 +565,7 @@ def color_winrate(val):
         if v >= 60:  return "color: #00e676;"
         elif v >= 45: return "color: #ffd600;"
         else:         return "color: #ff5252;"
-    except:
+    except (TypeError, ValueError):
         pass
     return ""
 
@@ -687,8 +577,8 @@ def highlight_best(row):
 sweep_styled = (
     sweep_sorted.style
     .apply(highlight_best, axis=1)
-    .applymap(color_net_pnl,  subset=["Net P&L", "Avg Win", "Avg Loss"])
-    .applymap(color_winrate,  subset=["Win Rate %"])
+    .map(color_net_pnl,  subset=["Net P&L", "Avg Win", "Avg Loss"])
+    .map(color_winrate,  subset=["Win Rate %"])
     .format({
         "RSI Threshold" : "{:d}",
         "Trades"        : "{:d}",
@@ -702,7 +592,7 @@ sweep_styled = (
     .set_properties(**{"text-align": "center"})
 )
 
-st.dataframe(sweep_styled, use_container_width=True, hide_index=True, height=420)
+st.dataframe(sweep_styled, width="stretch", hide_index=True, height=420)
 
 # Summary callout
 best_net  = round(sweep_df["Net P&L"].max(), 2)
@@ -735,7 +625,7 @@ with d1:
             data=trades_df.to_csv(index=False),
             file_name=f"{ticker_input}_trades_{yesterday}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
 with d2:
@@ -745,7 +635,7 @@ with d2:
         data=df[ind_cols].to_csv(index_label="Date"),
         file_name=f"{ticker_input}_indicators_{yesterday}.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 
 with d3:
@@ -772,7 +662,7 @@ with d3:
         data=json.dumps(summary_json, indent=4, default=str),
         file_name=f"{ticker_input}_summary_{yesterday}.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
     )
 
 st.markdown("---")
